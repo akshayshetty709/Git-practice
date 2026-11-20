@@ -1,0 +1,96 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven-3.9'   // name as configured in Manage Jenkins > Tools
+        jdk   'JDK-17'
+    }
+
+    parameters {
+        booleanParam(name: 'RUN_UI_TESTS', defaultValue: true,
+                     description: 'Run Selenium tests after deploy')
+        choice(name: 'TEST_SUITE', choices: ['smoke', 'regression'],
+               description: 'Which Selenium suite to run')
+    }
+
+    triggers {
+        // Nightly full regression (approx. 2 AM)
+        cron('H 2 * * *')
+    }
+
+    environment {
+        TEST_URL = 'https://test.yourapp.com'   // deployed test environment
+    }
+
+    options {
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Build') {
+            steps { sh 'mvn clean package -DskipTests' }
+        }
+
+        stage('Unit Tests') {
+            steps { sh 'mvn test' }
+            post {
+                always { junit 'target/surefire-reports/*.xml' }
+            }
+        }
+
+        stage('Deploy to Test') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch pattern: 'release/.*', comparator: 'REGEXP'
+                }
+            }
+            steps { sh './deploy.sh test' }
+        }
+
+        stage('Selenium Tests') {
+            when {
+                allOf {
+                    expression { params.RUN_UI_TESTS }
+                    anyOf {
+                        branch 'develop'
+                        branch pattern: 'release/.*', comparator: 'REGEXP'
+                    }
+                }
+            }
+            steps {
+                script {
+                    // Nightly (cron) builds always run full regression
+                    def suite = currentBuild.getBuildCauses('hudson.triggers.TimerTrigger$TimerTriggerCause') ?
+                                'regression' : params.TEST_SUITE
+                    sh """
+                        mvn verify -Pselenium \
+                            -Dsuite=${suite} \
+                            -Dbase.url=${TEST_URL} \
+                            -Dheadless=true
+                    """
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'target/failsafe-reports/*.xml'
+                    archiveArtifacts artifacts: 'screenshots/**, target/failsafe-reports/**',
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo 'Pipeline succeeded' }
+        failure { echo 'Pipeline failed - check test reports' }
+        // Add email/Slack here, e.g.:
+        // failure { mail to: 'team@company.com', subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}", body: "${env.BUILD_URL}" }
+    }
+}
